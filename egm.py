@@ -13,7 +13,7 @@ class BlackBoxLayer(nn.Module):
     def forward(self, x):
         return self.fn(x)
 
-class BlackBoxFunction(torch.autograd.Function):
+class PlaceholderFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input):
         ctx.save_for_backward(input)
@@ -24,18 +24,6 @@ class BlackBoxFunction(torch.autograd.Function):
         input, = ctx.saved_tensors
         grad_local = torch.ones(input.shape, dtype=torch.float32) * 10
         return grad_output * grad_local
-
-
-class RandomDataset(IterableDataset):
-    def __init__(self):
-        super().__init__()
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        return torch.round(torch.rand(8, dtype=torch.float32))
-
     
 class ModelWithBlackBoxLayer(nn.Module):
     def __init__(self):
@@ -48,7 +36,7 @@ class ModelWithBlackBoxLayer(nn.Module):
             nn.ReLU6(),
             nn.Linear(32, 64),  # 64 values put into NWP
             # NWP black box layer
-            BlackBoxLayer(BlackBoxFunction()),
+            BlackBoxLayer(PlaceholderFunction()),
             # Weather super resolution & fine tuning layer
             nn.Linear(64, 32),
             nn.ReLU6(),
@@ -59,11 +47,23 @@ class ModelWithBlackBoxLayer(nn.Module):
         )
 
     def forward(self, x):
-        x = self.stack(x)
-        return x
+        return self.stack(x)
 
-    
-def main():
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--batch-size", "--bs", type=int, default=128)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    args = parser.parse_args()    
+
+    # Super simple dataset: Just return us some random 0s and 1s.
+    class RandomDataset(IterableDataset):
+        def __init__(self):
+            super().__init__()
+        def __iter__(self):
+            return self
+        def __next__(self):
+            return torch.round(torch.rand(8, dtype=torch.float32))
+        
     ds = RandomDataset()
     dl = DataLoader(ds, batch_size=args.batch_size, num_workers=0)
 
@@ -80,19 +80,4 @@ def main():
 
         num_errors = (probs.round() - inputs).abs().sum().item()
         acc = 1.0 - num_errors / inputs.numel()
-        print(f"{loss.item()=:.4f}  {acc=:.4f}")
-        
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--batch-size", "--bs", type=int, default=1)
-    parser.add_argument("-g", "--gpu", type=int)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    args = parser.parse_args()    
-
-    device = torch.device("cpu")
-    if args.gpu is not None:
-        assert torch.cuda.is_available()
-        device = torch.device(f"cuda:{args.gpu}")
-        print(f"Using device {device}")
-
-    main()
+        print(f"loss={loss.item():.4f} {acc=:.4f}")
