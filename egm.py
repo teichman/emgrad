@@ -5,6 +5,26 @@ import argparse
 from torch.utils.data import DataLoader, IterableDataset
 import torch.nn.functional as F
 
+class BlackBoxLayer(nn.Module):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn.apply
+
+    def forward(self, x):
+        return self.fn(x)
+
+class BlackBoxFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input):
+        ctx.save_for_backward(input)
+        return 10 * input + 5
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, = ctx.saved_tensors
+        grad_local = torch.ones(input.shape, dtype=torch.float32) * 10
+        return grad_output * grad_local
+
 
 class RandomDataset(IterableDataset):
     def __init__(self):
@@ -27,7 +47,8 @@ class ModelWithBlackBoxLayer(nn.Module):
             nn.Linear(16, 32),
             nn.ReLU6(),
             nn.Linear(32, 64),  # 64 values put into NWP
-            # NWP black box layer (TODO)
+            # NWP black box layer
+            BlackBoxLayer(BlackBoxFunction()),
             # Weather super resolution & fine tuning layer
             nn.Linear(64, 32),
             nn.ReLU6(),
@@ -56,7 +77,10 @@ def main():
         loss = ((probs - inputs)**2).mean()
         loss.backward()
         optimizer.step()
-        print(f"{loss.item()=:.4f}")
+
+        num_errors = (probs.round() - inputs).abs().sum().item()
+        acc = 1.0 - num_errors / inputs.numel()
+        print(f"{loss.item()=:.4f}  {acc=:.4f}")
         
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
