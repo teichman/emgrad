@@ -5,11 +5,24 @@ import argparse
 from torch.utils.data import DataLoader, IterableDataset
 import torch.nn.functional as F
 
+
+def placeholder(x):
+    return 10 * x + 5
+
+def bbf2(x):
+    assert x.shape[1] % 2 == 0
+    idx = x.shape[1] // 2
+    return x[:, :idx] * x[:, idx:]
+
+vals = torch.rand(32)
+def bbf3(x):
+    return bbf2(x) * vals
+
 class BlackBoxFunction(torch.autograd.Function):
     @staticmethod
     def bbf(x):
         # Put whatever nightmare of code you want here.
-        return 10 * x + 5
+        return bbf3(x)
     
     @staticmethod
     def forward(ctx, x):
@@ -28,17 +41,18 @@ class BlackBoxFunction(torch.autograd.Function):
         # grad_output is (batch_size, output_size)
         # We need to return gradient matrix of (batch_size, input_size)
         # grad_local is (output_size, input_size)
-        # grad_local[i, j] is the empirical estimate of the derivative of the jth output wrt ith input.
+        # grad_local[i, j] is the empirical estimate of the derivative of the ith output wrt jth input.
         grad_local = torch.zeros((output_size, input_size), dtype=torch.float32)
         for _ in range(args.num_reps):
             for idx in range(input_size):
                 x[:, idx] += args.eps
                 y2 = BlackBoxFunction.forward(None, x)
                 x[:, idx] -= args.eps
-                grad_local[idx, :] += (y2 - y).sum(axis=0) / batch_size  # Average gradient across batch
+                grad_local[:, idx] += (y2 - y).sum(axis=0) / batch_size  # Average gradient across batch
+                assert not torch.any(torch.isnan(grad_local))
                 
-        grad_local /= args.num_reps
-        grad_local /= args.eps
+        grad_local /= args.num_reps  # Average across reps.
+        grad_local /= args.eps  # defn of derivative (but without the lim)
 
         return grad_output @ grad_local
     
@@ -79,10 +93,10 @@ class ModelWithBlackBoxLayer(nn.Module):
             nn.ReLU6(),
             nn.Linear(32, 64),  # 64 values put into NWP
             # NWP black box layer
-            #BlackBoxLayer(BlackBoxFunction()),
-            BlackBoxLayer(PlaceholderFunction()),
+            BlackBoxLayer(BlackBoxFunction()),
+            #BlackBoxLayer(PlaceholderFunction()),
             # Weather super resolution & fine tuning layer
-            nn.Linear(64, 32),
+            nn.Linear(32, 32),
             nn.ReLU6(),
             nn.Linear(32, 16),
             nn.ReLU6(),
@@ -97,8 +111,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch-size", "--bs", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--eps", type=float, default=1e-6)
-    parser.add_argument("--num-reps", type=int, default=5,
+    parser.add_argument("--eps", type=float, default=1e-5)
+    parser.add_argument("--num-reps", type=int, default=1,
                         help="Number of reps of empirical gradient estimation per backprop step.")
     args = parser.parse_args()    
 
