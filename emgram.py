@@ -5,28 +5,49 @@ import argparse
 from torch.utils.data import DataLoader, IterableDataset
 import torch.nn.functional as F
 
+# Put whatever nightmare of gradient-blocking code you want here.
+def black_box_fn(x):
+    x = bbf1(x)
+    # x = bbf2(x)
+    # x = stateful_bbf(x)
+    return x
 
-def placeholder(x):
-    return 10 * x + 5
+def bbf1(x):
+    z = 10 * x + 5
+    z = z.repeat(1, 2)
+    return z
 
-def bbf2(x):
-    assert x.shape[1] % 2 == 0
-    idx = x.shape[1] // 2
-    return x[:, :idx] * x[:, idx:]
+class StatefulBBF:
+    def __init__(self):
+        self.vals = torch.rand(64)
+        
+    def __call__(self, x):
+        return bbf1(x) * self.vals
 
-vals = torch.rand(32)
-def bbf3(x):
-    return bbf2(x) * vals
-
-class BlackBoxFunction(torch.autograd.Function):
-    @staticmethod
-    def bbf(x):
-        # Put whatever nightmare of code you want here.
-        return bbf3(x)
+stateful_bbf = StatefulBBF()
     
+
+# Ok this one is hard for the regular optimizer to solve too.
+# (See TestLayer.)
+def bbf2(x):
+    lengths = (x * x).sum(axis=1).sqrt().unsqueeze(1)
+    x = x / lengths
+    x = x.repeat(1, 2)
+    return x
+
+class TestLayer(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        return bbf2(x)
+
+# Implement backward pass as empirical gradient estimation.
+class EmpiricalGradientWrapper(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x):
-        y = BlackBoxFunction.bbf(x)
+        y = black_box_fn(x)
+        # We don't want to save these when forwarding for empirical gradient estimation.
         if ctx:
             ctx.save_for_backward(x, y)
         return y
@@ -45,62 +66,44 @@ class BlackBoxFunction(torch.autograd.Function):
         grad_local = torch.zeros((output_size, input_size), dtype=torch.float32)
         for _ in range(args.num_reps):
             for idx in range(input_size):
-                x[:, idx] += args.eps
-                y2 = BlackBoxFunction.forward(None, x)
-                x[:, idx] -= args.eps
-                grad_local[:, idx] += (y2 - y).sum(axis=0) / batch_size  # Average gradient across batch
-                assert not torch.any(torch.isnan(grad_local))
+                eps = args.eps_mult * x[:, idx].abs().mean()
+                x[:, idx] += eps
+                y2 = EmpiricalGradientWrapper.forward(None, x)
+                x[:, idx] -= eps
+                grad_local[:, idx] += (y2 - y).sum(axis=0) / (eps * batch_size)  # Average gradient across batch
                 
         grad_local /= args.num_reps  # Average across reps.
-        grad_local /= args.eps  # defn of derivative (but without the lim)
 
         return grad_output @ grad_local
-    
-class PlaceholderFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x):
-        ctx.save_for_backward(x)
-        return 10 * x + 5
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        x, = ctx.saved_tensors
-        grad_local = torch.ones(x.shape, dtype=torch.float32) * 10  # dout/din
-        # grad_output is dL/dout
-        # We need to return dL/din = dL/dout * dout/din.
-        # It'll have one value per input element per batch.
-        # Shape of return tensor should be (batch_size, input_size)
-        result = grad_output * grad_local
-        assert result.shape == x.shape
-        return result
 
 class BlackBoxLayer(nn.Module):
-    def __init__(self, fn):
+    def __init__(self):
         super().__init__()
-        self.fn = fn.apply
 
     def forward(self, x):
-        return self.fn(x)
+        return EmpiricalGradientWrapper().apply(x)
     
 class ModelWithBlackBoxLayer(nn.Module):
     def __init__(self):
         super().__init__()
         self.stack = nn.Sequential(
-            # Parameterizations
-            nn.Linear(8, 16),
+            # Deep net implementation of NWP parameterizations
+            nn.Linear(32, 64),  # Potentially high-d input, can be anything
             nn.ReLU6(),
-            nn.Linear(16, 32),
+            nn.Linear(64, 32),
+            
+            # NWP black box
+            #TestLayer(),
+            BlackBoxLayer(),
+            
+            # Weather super resolution & "style transfer"
+            nn.Linear(64, 128),
             nn.ReLU6(),
-            nn.Linear(32, 64),  # 64 values put into NWP
-            # NWP black box layer
-            BlackBoxLayer(BlackBoxFunction()),
-            #BlackBoxLayer(PlaceholderFunction()),
-            # Weather super resolution & fine tuning layer
-            nn.Linear(32, 32),
+            nn.Linear(128, 64),
             nn.ReLU6(),
-            nn.Linear(32, 16),
+            nn.Linear(64, 64),
             nn.ReLU6(),
-            nn.Linear(16, 8),
+            nn.Linear(64, 32),
             nn.Sigmoid()
         )
 
@@ -110,26 +113,30 @@ class ModelWithBlackBoxLayer(nn.Module):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch-size", "--bs", type=int, default=128)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--eps", type=float, default=1e-5)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--eps-mult", type=float, default=1e-3)
     parser.add_argument("--num-reps", type=int, default=1,
                         help="Number of reps of empirical gradient estimation per backprop step.")
     args = parser.parse_args()    
 
-    # Super simple dataset: Just return us some random 0s and 1s.
+    # Super simple dataset: Just return a random tensor.
+    # Deep net is trained to reproduce it as output.
     class RandomDataset(IterableDataset):
         def __init__(self):
             super().__init__()
         def __iter__(self):
             return self
         def __next__(self):
-            return torch.round(torch.rand(8, dtype=torch.float32))
+            return torch.round(torch.rand(32, dtype=torch.float32))
         
     ds = RandomDataset()
     dl = DataLoader(ds, batch_size=args.batch_size, num_workers=0)
 
+    torch.autograd.set_detect_anomaly(True)
+    
     model = ModelWithBlackBoxLayer()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    #optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
 
     model.train(True)
     for step, inputs in enumerate(dl):
