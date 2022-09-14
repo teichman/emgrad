@@ -13,7 +13,7 @@ def black_box_fn(x):
     return x
 
 def bbf1(x):
-    z = 10 * x + 5
+    z = 10 * x**2 + 5
     z = z.repeat(1, 2)
     return z
 
@@ -40,7 +40,7 @@ class TestLayer(nn.Module):
         super().__init__()
 
     def forward(self, x):
-        return bbf2(x)
+        return bbf1(x)
 
 # Implement backward pass as empirical gradient estimation.
 class EmpiricalGradientWrapper(torch.autograd.Function):
@@ -58,23 +58,27 @@ class EmpiricalGradientWrapper(torch.autograd.Function):
         batch_size = x.shape[0]
         input_size = x.shape[1]
         output_size = grad_output.shape[1]
+
+        x = x.type(torch.float64)
         
         # grad_output is (batch_size, output_size)
         # We need to return gradient matrix of (batch_size, input_size)
         # grad_local is (output_size, input_size)
         # grad_local[i, j] is the empirical estimate of the derivative of the ith output wrt jth input.
-        grad_local = torch.zeros((output_size, input_size), dtype=torch.float32)
+        grad_local = torch.zeros((output_size, input_size), dtype=torch.float64)
         for _ in range(args.num_reps):
             for idx in range(input_size):
-                eps = args.eps_mult * x[:, idx].abs().mean()
+                eps = args.eps_mult * x[:, idx].abs().mean()                
+                #print(f"mean: {x[:, idx].abs().mean()} eps: {eps}")
                 x[:, idx] += eps
                 y2 = EmpiricalGradientWrapper.forward(None, x)
                 x[:, idx] -= eps
-                grad_local[:, idx] += (y2 - y).sum(axis=0) / (eps * batch_size)  # Average gradient across batch
+                dodi = (y2 - y) / eps  # dout/din
+                grad_local[:, idx] += dodi.sum(axis=0) / batch_size  # Average gradient across batch
                 
         grad_local /= args.num_reps  # Average across reps.
 
-        return grad_output @ grad_local
+        return grad_output @ grad_local.type(torch.float32)
 
 class BlackBoxLayer(nn.Module):
     def __init__(self):
@@ -113,8 +117,8 @@ class ModelWithBlackBoxLayer(nn.Module):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch-size", "--bs", type=int, default=128)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--eps-mult", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=1e-2)
+    parser.add_argument("--eps-mult", type=float, default=1e-5)
     parser.add_argument("--num-reps", type=int, default=1,
                         help="Number of reps of empirical gradient estimation per backprop step.")
     args = parser.parse_args()    
