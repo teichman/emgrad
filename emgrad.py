@@ -32,7 +32,7 @@ class EmgradWrapper(torch.autograd.Function):
         # grad_output is (batch_size, output_size)
         # We need to return gradient matrix of (batch_size, input_size)
         # grad_local[i, j, k] is the empirical estimate of the derivative of the jth output wrt the kth input in the ith batch.
-        grad_local = torch.zeros((batch_size, output_size, input_size), dtype=torch.float64)
+        grad_local = torch.zeros((batch_size, output_size, input_size), dtype=torch.float64, device=x.device)
         for _ in range(args.num_reps):
             for idx in range(input_size):
                 x[:, idx] += args.eps
@@ -44,9 +44,8 @@ class EmgradWrapper(torch.autograd.Function):
 
         # Compute analytic gradient for comparison.
         if torch.rand(1) < args.analytic_comparison_frac:
-            gla = torch.zeros((batch_size, output_size, input_size), dtype=torch.float64)
+            gla = torch.zeros((batch_size, output_size, input_size), dtype=torch.float64, device=x.device)
             xa = x.clone().detach().requires_grad_(True)
-            #xa = torch.tensor(x.detach(), requires_grad=True)
             torch.set_grad_enabled(True)  # Apparently when pytorch calls backward, we're in no-grad mode.
             ya = EmgradWrapper.forward(None, xa)  # (batch size, output_size)
             ya.retain_grad()
@@ -202,11 +201,12 @@ def train():
     ds = RandomDataset()
     dl = DataLoader(ds, batch_size=args.batch_size, num_workers=0)
     
-    model = Model()
+    model = Model().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     model.train(True)
     for step, inputs in enumerate(dl):
+        inputs = inputs.to(device)
         probs = model(inputs)
         loss = ((probs - inputs)**2).mean()
         optimizer.zero_grad()
@@ -218,7 +218,7 @@ def train():
             acc = 1.0 - num_errors / inputs.numel()
             print(f"{step=} loss={loss.item():.4f} {acc=:.4f}")
 
-        if acc > 0.99:
+        if acc > 0.98:
             print(f"Reached {acc=:0.4f} in {step} steps.")
             break
 
@@ -227,8 +227,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch-size", "--bs", type=int, default=60)
     parser.add_argument("--bbf", type=int, default=1)
+    parser.add_argument("-g", "--gpu", type=int)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--eps", type=float, default=1e-4)
+    parser.add_argument("--eps", type=float, default=1e-5)
     parser.add_argument("--clip", type=float, default=1)
     parser.add_argument("--autograd", action="store_true", help="Use autograd instead of emgrad for comparison.")
     parser.add_argument("-a", "--analytic-comparison-frac", type=float, default=0.0)
@@ -236,4 +237,10 @@ if __name__ == "__main__":
                         help="Number of reps of empirical gradient estimation per backprop step.")
     args = parser.parse_args()    
 
+    device = torch.device("cpu")
+    if args.gpu is not None:
+        assert torch.cuda.is_available()
+        device = torch.device(f"cuda:{args.gpu}")
+        print(f"Using device {device}")
+        
     train()
