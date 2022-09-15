@@ -42,10 +42,34 @@ class EmpiricalGradientWrapper(torch.autograd.Function):
                 
         grad_local /= args.num_reps  # Average across reps.
 
+        # Compute analytic gradient for comparison.
+        if torch.rand(1) < args.analytic_comparison_frac:
+            gla = torch.zeros((batch_size, output_size, input_size), dtype=torch.float64)
+            xa = x.clone().detach().requires_grad_(True)
+            #xa = torch.tensor(x.detach(), requires_grad=True)
+            torch.set_grad_enabled(True)  # Apparently when pytorch calls backward, we're in no-grad mode.
+            ya = EmpiricalGradientWrapper.forward(None, xa)  # (batch size, output_size)
+            ya.retain_grad()
+            # Autograd has to be done on a scalar, so we'll slowly iterate through each element 
+            # and reconstruct grad_local but computed with autograd.
+            for bidx, batch in enumerate(ya):
+                for eidx, element in enumerate(batch):
+                    if xa.grad is not None: xa.grad.zero_()
+                    element.backward(retain_graph=True)
+                    flags = xa.grad.sum(axis=1) != 0
+                    flags[bidx] = False
+                    assert flags.sum() == 0, "everything outside the batch we are inspecting should be zero"
+                    #xa.grad is (batch_size, input_size)
+                    gla[bidx, eidx, :] = xa.grad[bidx]
+
+            avg_abs_error = (grad_local - gla).abs().mean()
+            print(f"{avg_abs_error=:.4f}")
+            torch.set_grad_enabled(False)
+
         # Simple gradient clipping.
         if args.clip:
             grad_local.clip(min=-args.clip, max=args.clip)
-
+            
         # dout/din * dL/dout for all batch elements.
         grad_in = (grad_local.permute(0, 2, 1).type(torch.float32) @ grad_output.unsqueeze(2)).squeeze()
         return grad_in
@@ -60,24 +84,25 @@ class BlackBoxLayer(nn.Module):
     def forward(self, x):
         return self.egw.apply(x)
 
-    def backward(self, ctx, grad_output):
-        assert False
-
 
 ############################################################
 # A few simple black box functions to choose from.
 ############################################################
 
-# To be really sure that torch autograd can't operate here, do some operations in numpy.
-
 def bbf1(x):
+    x = 10 * x + 5
+    x = x.repeat(1, 2)
+    return x
+
+# To be really sure that torch autograd can't operate here, do some operations in numpy.
+def bbf1_numpy(x):
     z = x.numpy().copy()
     z = 10 * z + 5
     x = torch.from_numpy(z)
     x = x.repeat(1, 2)
     return x
 
-def bbf2(x):
+def bbf2_numpy(x):
     z = x.numpy().copy()  
     z = 10 * z**2 + 5
     x = torch.from_numpy(z)
@@ -89,9 +114,9 @@ class StatefulBBF:
         self.vals = torch.rand(64)
         
     def __call__(self, x):
-        return bbf2(x) * self.vals
+        return bbf2_numpy(x) * self.vals
 
-bbf3 = StatefulBBF()
+bbf3_numpy = StatefulBBF()
     
 def bbf4(x):
     lengths = (x * x).sum(axis=1).sqrt().unsqueeze(1)
@@ -104,7 +129,7 @@ def bbf4(x):
 # Model
 ############################################################
         
-class ModelWithBlackBoxLayer(nn.Module):
+class Model(nn.Module):
     def __init__(self):
         super().__init__()
         self.stack = nn.Sequential(
@@ -116,7 +141,7 @@ class ModelWithBlackBoxLayer(nn.Module):
             # NWP black box.
             # Put whatever gross nightmare of a function you want in here,
             # without a defined backwards method and without torch autograd.
-            BlackBoxLayer(bbf4),
+            BlackBoxLayer(bbf1),
             
             # Weather super resolution & "style transfer"
             nn.Linear(64, 128),
@@ -139,10 +164,11 @@ class ModelWithBlackBoxLayer(nn.Module):
     
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--batch-size", "--bs", type=int, default=64)
+    parser.add_argument("--batch-size", "--bs", type=int, default=60)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--eps", type=float, default=1e-5)
     parser.add_argument("--clip", type=float, default=1)
+    parser.add_argument("--analytic-comparison-frac", type=float, default=0.0)
     parser.add_argument("--num-reps", type=int, default=1,
                         help="Number of reps of empirical gradient estimation per backprop step.")
     args = parser.parse_args()    
@@ -162,7 +188,7 @@ if __name__ == "__main__":
 
     torch.autograd.set_detect_anomaly(True)
     
-    model = ModelWithBlackBoxLayer()
+    model = Model()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     #optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.0)
 
