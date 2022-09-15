@@ -42,6 +42,10 @@ class EmpiricalGradientWrapper(torch.autograd.Function):
                 
         grad_local /= args.num_reps  # Average across reps.
 
+        # Simple gradient clipping.
+        if args.clip:
+            grad_local.clip(min=-args.clip, max=args.clip)
+
         # dout/din * dL/dout for all batch elements.
         grad_in = (grad_local.permute(0, 2, 1).type(torch.float32) @ grad_output.unsqueeze(2)).squeeze()
         return grad_in
@@ -64,13 +68,16 @@ class BlackBoxLayer(nn.Module):
 # A few simple black box functions to choose from.
 ############################################################
 
+# To be really sure that torch autograd can't operate here, do some operations in numpy.
+
 def bbf1(x):
-    z = 10 * x + 5
-    z = z.repeat(1, 2)
-    return z
+    z = x.numpy().copy()
+    z = 10 * z + 5
+    x = torch.from_numpy(z)
+    x = x.repeat(1, 2)
+    return x
 
 def bbf2(x):
-    # To be really sure that torch autograd can't operate here, do some operations in numpy.
     z = x.numpy().copy()  
     z = 10 * z**2 + 5
     x = torch.from_numpy(z)
@@ -86,7 +93,7 @@ class StatefulBBF:
 
 bbf3 = StatefulBBF()
     
-def bbf2(x):
+def bbf4(x):
     lengths = (x * x).sum(axis=1).sqrt().unsqueeze(1)
     x = x / lengths
     x = x.repeat(1, 2)
@@ -109,7 +116,7 @@ class ModelWithBlackBoxLayer(nn.Module):
             # NWP black box.
             # Put whatever gross nightmare of a function you want in here,
             # without a defined backwards method and without torch autograd.
-            BlackBoxLayer(bbf2),
+            BlackBoxLayer(bbf4),
             
             # Weather super resolution & "style transfer"
             nn.Linear(64, 128),
@@ -132,9 +139,10 @@ class ModelWithBlackBoxLayer(nn.Module):
     
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--batch-size", "--bs", type=int, default=128)
+    parser.add_argument("--batch-size", "--bs", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--eps", type=float, default=1e-5)
+    parser.add_argument("--clip", type=float, default=1)
     parser.add_argument("--num-reps", type=int, default=1,
                         help="Number of reps of empirical gradient estimation per backprop step.")
     args = parser.parse_args()    
@@ -160,12 +168,17 @@ if __name__ == "__main__":
 
     model.train(True)
     for step, inputs in enumerate(dl):
-        optimizer.zero_grad()
         probs = model(inputs)
         loss = ((probs - inputs)**2).mean()
+        optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        num_errors = (probs.round() - inputs).abs().sum().item()
-        acc = 1.0 - num_errors / inputs.numel()
-        print(f"{step=} loss={loss.item():.4f} {acc=:.4f}")
+        if step % 100 == 0:
+            num_errors = (probs.round() - inputs).abs().sum().item()
+            acc = 1.0 - num_errors / inputs.numel()
+            print(f"{step=} loss={loss.item():.4f} {acc=:.4f}")
+
+        if acc > 0.99:
+            print(f"Reached {acc=:0.4f} in {step} steps.")
+            break
