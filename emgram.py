@@ -66,11 +66,10 @@ class EmpiricalGradientWrapper(torch.autograd.Function):
         grad_local = torch.zeros((batch_size, output_size, input_size), dtype=torch.float64)
         for _ in range(args.num_reps):
             for idx in range(input_size):
-                eps = args.eps_mult * x[:, idx].abs().mean()                
-                x[:, idx] += eps
+                x[:, idx] += args.eps
                 y2 = EmpiricalGradientWrapper.forward(None, x)
-                x[:, idx] -= eps
-                grad_local[:, :, idx] += (y2 - y) / eps
+                x[:, idx] -= args.eps
+                grad_local[:, :, idx] += (y2 - y) / args.eps
                 
         grad_local /= args.num_reps  # Average across reps.
 
@@ -116,7 +115,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch-size", "--bs", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--eps-mult", type=float, default=1e-2)
+    parser.add_argument("--eps", type=float, default=1e-5)
     parser.add_argument("--num-reps", type=int, default=1,
                         help="Number of reps of empirical gradient estimation per backprop step.")
     args = parser.parse_args()    
