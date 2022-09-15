@@ -8,14 +8,14 @@ from torch.utils.data import DataLoader, IterableDataset
 # Implementation of empirical gradient backward pass
 ############################################################
 
-class EmpiricalGradientWrapper(torch.autograd.Function):
+class EmgradWrapper(torch.autograd.Function):
     @staticmethod
     def black_box_fn(x):
         raise NotImplementedError
     
     @staticmethod
     def forward(ctx, x):
-        y = EmpiricalGradientWrapper.black_box_fn(x)
+        y = EmgradWrapper.black_box_fn(x)
         # We don't want to save these when forwarding for empirical gradient estimation.
         if ctx:
             ctx.save_for_backward(x, y)
@@ -36,7 +36,7 @@ class EmpiricalGradientWrapper(torch.autograd.Function):
         for _ in range(args.num_reps):
             for idx in range(input_size):
                 x[:, idx] += args.eps
-                y2 = EmpiricalGradientWrapper.forward(None, x)
+                y2 = EmgradWrapper.forward(None, x)
                 x[:, idx] -= args.eps
                 grad_local[:, :, idx] += (y2 - y) / args.eps
                 
@@ -48,7 +48,7 @@ class EmpiricalGradientWrapper(torch.autograd.Function):
             xa = x.clone().detach().requires_grad_(True)
             #xa = torch.tensor(x.detach(), requires_grad=True)
             torch.set_grad_enabled(True)  # Apparently when pytorch calls backward, we're in no-grad mode.
-            ya = EmpiricalGradientWrapper.forward(None, xa)  # (batch size, output_size)
+            ya = EmgradWrapper.forward(None, xa)  # (batch size, output_size)
             ya.retain_grad()
             # Autograd has to be done on a scalar, so we'll slowly iterate through each element 
             # and reconstruct grad_local but computed with autograd.
@@ -63,7 +63,9 @@ class EmpiricalGradientWrapper(torch.autograd.Function):
                     gla[bidx, eidx, :] = xa.grad[bidx]
 
             avg_abs_error = (grad_local - gla).abs().mean()
-            print(f"{avg_abs_error=:.4f}")
+            avg_abs_gla = gla.abs().mean()
+            rel_error = avg_abs_error / avg_abs_gla
+            print(f"Avg mag of emgrad errors: {avg_abs_error:.4f}  Avg mag of analytic gradients: {avg_abs_gla:.4f}  Rel: {rel_error:.4f}")
             torch.set_grad_enabled(False)
 
         # Simple gradient clipping.
@@ -78,12 +80,21 @@ class EmpiricalGradientWrapper(torch.autograd.Function):
 class BlackBoxLayer(nn.Module):
     def __init__(self, black_box_fn):
         super().__init__()
-        self.egw = EmpiricalGradientWrapper()
-        EmpiricalGradientWrapper.black_box_fn = black_box_fn  # This is really gross but whatever
+        self.egw = EmgradWrapper()
+        EmgradWrapper.black_box_fn = black_box_fn  # This is really gross but whatever
 
     def forward(self, x):
         return self.egw.apply(x)
 
+# Drop in replacement for BlackBoxLayer that uses autograd.
+class AnalyticLayer(nn.Module):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def forward(self, x):
+        return self.fn(x)
+    
 
 ############################################################
 # A few simple black box functions to choose from.
@@ -99,6 +110,11 @@ def bbf1_numpy(x):
     z = x.numpy().copy()
     z = 10 * z + 5
     x = torch.from_numpy(z)
+    x = x.repeat(1, 2)
+    return x
+
+def bbf2(x):
+    x = 10 * x**2 + 5
     x = x.repeat(1, 2)
     return x
 
@@ -139,9 +155,8 @@ class Model(nn.Module):
             nn.Linear(64, 32),
             
             # NWP black box.
-            # Put whatever gross nightmare of a function you want in here,
-            # without a defined backwards method and without torch autograd.
-            BlackBoxLayer(bbf1),
+            BlackBoxLayer(bbf4),
+            #AnalyticLayer(bbf4),
             
             # Weather super resolution & "style transfer"
             nn.Linear(64, 128),
@@ -168,7 +183,7 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--eps", type=float, default=1e-5)
     parser.add_argument("--clip", type=float, default=1)
-    parser.add_argument("--analytic-comparison-frac", type=float, default=0.0)
+    parser.add_argument("-a", "--analytic-comparison-frac", type=float, default=0.0)
     parser.add_argument("--num-reps", type=int, default=1,
                         help="Number of reps of empirical gradient estimation per backprop step.")
     args = parser.parse_args()    
@@ -208,3 +223,4 @@ if __name__ == "__main__":
         if acc > 0.99:
             print(f"Reached {acc=:0.4f} in {step} steps.")
             break
+        
