@@ -75,8 +75,64 @@ class EmgradWrapper(torch.autograd.Function):
         # dout/din * dL/dout for all batch elements.
         grad_in = (grad_local.permute(0, 2, 1).type(torch.float32) @ grad_output.unsqueeze(2)).squeeze()
         return grad_in
+    
 
-# Glue
+############################################################
+# A few simple black box functions to choose from.
+############################################################
+
+def bbf0(x):
+    x = 10 * x + 5
+    x = x.repeat(1, 2)
+    return x
+
+def bbf1(x):
+    x = x**2 + 5
+    x = x.repeat(1, 2)
+    return x
+
+class StatefulBBF:
+    def __init__(self):
+        self.vals = torch.rand(64)
+    def __call__(self, x):
+        return bbf0(x) + bbf1(x) * self.vals
+bbf2 = StatefulBBF()
+    
+def bbf3(x):
+    lengths = (x * x).sum(axis=1).sqrt().unsqueeze(1)
+    x = x / lengths
+    x = x.repeat(1, 2)
+    return x
+
+def bbf4(x):
+    x = bbf2(x)
+    x = torch.where(x > 3, x.log(), x)
+    return x
+
+bbfs = [bbf0, bbf1, bbf2, bbf3, bbf4]
+
+# To be really sure that torch autograd can't operate here, do some operations in numpy.
+# (Analytic gradient comparisons not possible here, ofc.)
+def bbf0_numpy(x):
+    z = x.numpy().copy()
+    z = 10 * z + 5
+    x = torch.from_numpy(z)
+    x = x.repeat(1, 2)
+    return x
+
+def bbf1_numpy(x):
+    z = x.numpy().copy()  
+    z = 10 * z**2 + 5
+    x = torch.from_numpy(z)
+    x = x.repeat(1, 2)
+    return x
+
+    
+############################################################
+# Model
+############################################################
+
+# Layer that takes an arbitrary python function and tells pytorch to use emgrad for training.
 class BlackBoxLayer(nn.Module):
     def __init__(self, black_box_fn):
         super().__init__()
@@ -94,60 +150,15 @@ class AnalyticLayer(nn.Module):
 
     def forward(self, x):
         return self.fn(x)
-    
 
-############################################################
-# A few simple black box functions to choose from.
-############################################################
-
-def bbf1(x):
-    x = 10 * x + 5
-    x = x.repeat(1, 2)
-    return x
-
-# To be really sure that torch autograd can't operate here, do some operations in numpy.
-def bbf1_numpy(x):
-    z = x.numpy().copy()
-    z = 10 * z + 5
-    x = torch.from_numpy(z)
-    x = x.repeat(1, 2)
-    return x
-
-def bbf2(x):
-    x = 10 * x**2 + 5
-    x = x.repeat(1, 2)
-    return x
-
-def bbf2_numpy(x):
-    z = x.numpy().copy()  
-    z = 10 * z**2 + 5
-    x = torch.from_numpy(z)
-    x = x.repeat(1, 2)
-    return x
-
-class StatefulBBF:
-    def __init__(self):
-        self.vals = torch.rand(64)
-        
-    def __call__(self, x):
-        return bbf2_numpy(x) * self.vals
-
-bbf3_numpy = StatefulBBF()
-    
-def bbf4(x):
-    lengths = (x * x).sum(axis=1).sqrt().unsqueeze(1)
-    x = x / lengths
-    x = x.repeat(1, 2)
-    return x
-
-        
-############################################################
-# Model
-############################################################
-        
 class Model(nn.Module):
     def __init__(self):
         super().__init__()
+
+        black_box_layer = BlackBoxLayer(bbfs[args.bbf])
+        if args.autograd:
+            black_box_layer = AnalyticLayer(bbfs[args.bbf])
+        
         self.stack = nn.Sequential(
             # Deep net implementation of NWP parameterizations
             nn.Linear(32, 64),  # Potentially high-d input, can be anything
@@ -155,8 +166,8 @@ class Model(nn.Module):
             nn.Linear(64, 32),
             
             # NWP black box.
-            BlackBoxLayer(bbf4),
-            #AnalyticLayer(bbf4),
+            black_box_layer,
+            # BlackBoxLayer(bbf1_numpy),
             
             # Weather super resolution & "style transfer"
             nn.Linear(64, 128),
@@ -176,18 +187,8 @@ class Model(nn.Module):
 ############################################################
 # Training
 ############################################################
-    
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--batch-size", "--bs", type=int, default=60)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--eps", type=float, default=1e-5)
-    parser.add_argument("--clip", type=float, default=1)
-    parser.add_argument("-a", "--analytic-comparison-frac", type=float, default=0.0)
-    parser.add_argument("--num-reps", type=int, default=1,
-                        help="Number of reps of empirical gradient estimation per backprop step.")
-    args = parser.parse_args()    
 
+def train():
     # Super simple dataset: Just return a random tensor.
     # Deep net is trained to reproduce it as output.
     class RandomDataset(IterableDataset):
@@ -200,12 +201,9 @@ if __name__ == "__main__":
         
     ds = RandomDataset()
     dl = DataLoader(ds, batch_size=args.batch_size, num_workers=0)
-
-    torch.autograd.set_detect_anomaly(True)
     
     model = Model()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    #optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.0)
 
     model.train(True)
     for step, inputs in enumerate(dl):
@@ -223,4 +221,19 @@ if __name__ == "__main__":
         if acc > 0.99:
             print(f"Reached {acc=:0.4f} in {step} steps.")
             break
+
         
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--batch-size", "--bs", type=int, default=60)
+    parser.add_argument("--bbf", type=int, default=1)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--eps", type=float, default=1e-4)
+    parser.add_argument("--clip", type=float, default=1)
+    parser.add_argument("--autograd", action="store_true", help="Use autograd instead of emgrad for comparison.")
+    parser.add_argument("-a", "--analytic-comparison-frac", type=float, default=0.0)
+    parser.add_argument("--num-reps", type=int, default=1,
+                        help="Number of reps of empirical gradient estimation per backprop step.")
+    args = parser.parse_args()    
+
+    train()
