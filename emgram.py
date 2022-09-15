@@ -1,39 +1,7 @@
 import torch
 import torch.nn as nn
-import math
 import argparse
 from torch.utils.data import DataLoader, IterableDataset
-import torch.nn.functional as F
-
-
-############################################################
-# Black box functions to choose from
-############################################################
-
-def bbf1(x):
-    z = 10 * x + 5
-    z = z.repeat(1, 2)
-    return z
-
-def bbf2(x):
-    z = 10 * x**2 + 5
-    z = z.repeat(1, 2)
-    return z
-
-class StatefulBBF:
-    def __init__(self):
-        self.vals = torch.rand(64)
-        
-    def __call__(self, x):
-        return bbf2(x) * self.vals
-
-bbf3 = StatefulBBF()
-    
-def bbf2(x):
-    lengths = (x * x).sum(axis=1).sqrt().unsqueeze(1)
-    x = x / lengths
-    x = x.repeat(1, 2)
-    return x
 
 
 ############################################################
@@ -93,6 +61,39 @@ class BlackBoxLayer(nn.Module):
 
 
 ############################################################
+# A few simple black box functions to choose from.
+############################################################
+
+def bbf1(x):
+    z = 10 * x + 5
+    z = z.repeat(1, 2)
+    return z
+
+def bbf2(x):
+    # To be really sure that torch autograd can't operate here, do some operations in numpy.
+    z = x.numpy().copy()  
+    z = 10 * z**2 + 5
+    x = torch.from_numpy(z)
+    x = x.repeat(1, 2)
+    return x
+
+class StatefulBBF:
+    def __init__(self):
+        self.vals = torch.rand(64)
+        
+    def __call__(self, x):
+        return bbf2(x) * self.vals
+
+bbf3 = StatefulBBF()
+    
+def bbf2(x):
+    lengths = (x * x).sum(axis=1).sqrt().unsqueeze(1)
+    x = x / lengths
+    x = x.repeat(1, 2)
+    return x
+
+        
+############################################################
 # Model
 ############################################################
         
@@ -106,8 +107,9 @@ class ModelWithBlackBoxLayer(nn.Module):
             nn.Linear(64, 32),
             
             # NWP black box.
-            # Put whatever gross nightmare of a function you want in here, without a defined backwards method.
-            BlackBoxLayer(bbf1),
+            # Put whatever gross nightmare of a function you want in here,
+            # without a defined backwards method and without torch autograd.
+            BlackBoxLayer(bbf2),
             
             # Weather super resolution & "style transfer"
             nn.Linear(64, 128),
