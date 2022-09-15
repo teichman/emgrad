@@ -5,14 +5,17 @@ import argparse
 from torch.utils.data import DataLoader, IterableDataset
 import torch.nn.functional as F
 
-# Put whatever nightmare of gradient-blocking code you want here.
-def black_box_fn(x):
-    x = bbf1(x)
-    # x = bbf2(x)
-    # x = stateful_bbf(x)
-    return x
+
+############################################################
+# Black box functions to choose from
+############################################################
 
 def bbf1(x):
+    z = 10 * x + 5
+    z = z.repeat(1, 2)
+    return z
+
+def bbf2(x):
     z = 10 * x**2 + 5
     z = z.repeat(1, 2)
     return z
@@ -22,31 +25,29 @@ class StatefulBBF:
         self.vals = torch.rand(64)
         
     def __call__(self, x):
-        return bbf1(x) * self.vals
+        return bbf2(x) * self.vals
 
-stateful_bbf = StatefulBBF()
+bbf3 = StatefulBBF()
     
-
-# Ok this one is hard for the regular optimizer to solve too.
-# (See TestLayer.)
 def bbf2(x):
     lengths = (x * x).sum(axis=1).sqrt().unsqueeze(1)
     x = x / lengths
     x = x.repeat(1, 2)
     return x
 
-class TestLayer(nn.Module):
-    def __init__(self):
-        super().__init__()
 
-    def forward(self, x):
-        return bbf1(x)
+############################################################
+# Implementation of empirical gradient backward pass
+############################################################
 
-# Implement backward pass as empirical gradient estimation.
 class EmpiricalGradientWrapper(torch.autograd.Function):
     @staticmethod
+    def black_box_fn(x):
+        raise NotImplementedError
+    
+    @staticmethod
     def forward(ctx, x):
-        y = black_box_fn(x)
+        y = EmpiricalGradientWrapper.black_box_fn(x)
         # We don't want to save these when forwarding for empirical gradient estimation.
         if ctx:
             ctx.save_for_backward(x, y)
@@ -77,13 +78,24 @@ class EmpiricalGradientWrapper(torch.autograd.Function):
         grad_in = (grad_local.permute(0, 2, 1).type(torch.float32) @ grad_output.unsqueeze(2)).squeeze()
         return grad_in
 
+# Glue
 class BlackBoxLayer(nn.Module):
-    def __init__(self):
+    def __init__(self, black_box_fn):
         super().__init__()
+        self.egw = EmpiricalGradientWrapper()
+        EmpiricalGradientWrapper.black_box_fn = black_box_fn  # This is really gross but whatever
 
     def forward(self, x):
-        return EmpiricalGradientWrapper().apply(x)
-    
+        return self.egw.apply(x)
+
+    def backward(self, ctx, grad_output):
+        assert False
+
+
+############################################################
+# Model
+############################################################
+        
 class ModelWithBlackBoxLayer(nn.Module):
     def __init__(self):
         super().__init__()
@@ -93,9 +105,9 @@ class ModelWithBlackBoxLayer(nn.Module):
             nn.ReLU6(),
             nn.Linear(64, 32),
             
-            # NWP black box
-            #TestLayer(),
-            BlackBoxLayer(),
+            # NWP black box.
+            # Put whatever gross nightmare of a function you want in here, without a defined backwards method.
+            BlackBoxLayer(bbf1),
             
             # Weather super resolution & "style transfer"
             nn.Linear(64, 128),
@@ -111,6 +123,11 @@ class ModelWithBlackBoxLayer(nn.Module):
     def forward(self, x):
         return self.stack(x)
 
+    
+############################################################
+# Training
+############################################################
+    
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch-size", "--bs", type=int, default=128)
@@ -137,7 +154,7 @@ if __name__ == "__main__":
     
     model = ModelWithBlackBoxLayer()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    #optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
+    #optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.0)
 
     model.train(True)
     for step, inputs in enumerate(dl):
