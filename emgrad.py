@@ -154,21 +154,22 @@ class Model(nn.Module):
     def __init__(self):
         super().__init__()
 
-        black_box_layer = BlackBoxLayer(bbfs[args.bbf])
-        if args.autograd:
-            black_box_layer = AnalyticLayer(bbfs[args.bbf])
-        
-        self.stack = nn.Sequential(
-            # Deep net implementation of NWP parameterizations
-            nn.Linear(32, 64),  # Potentially high-d input, can be anything
+        # Parameterizations, e.g. 
+        # Potentially high-d input, e.g. various state of each grid cell.
+        # Output of this deep net is a few global parameters
+        self.nwp_parameterizations = nn.Sequential(
+            nn.Linear(32, 64),  
             nn.ReLU6(),
             nn.Linear(64, 32),
-            
-            # NWP black box.
-            black_box_layer,
-            # BlackBoxLayer(bbf1_numpy),
-            
-            # Weather super resolution & "style transfer"
+        )
+
+        # NWP numerical solver that blocks gradients.
+        self.black_box_layer = BlackBoxLayer(bbfs[args.bbf])
+        if args.autograd:
+            self.black_box_layer = AnalyticLayer(bbfs[args.bbf])
+
+        # Super-resolution & "style transfer" step.
+        self.super_res = nn.Sequential(
             nn.Linear(64, 128),
             nn.ReLU6(),
             nn.Linear(128, 64),
@@ -176,11 +177,14 @@ class Model(nn.Module):
             nn.Linear(64, 64),
             nn.ReLU6(),
             nn.Linear(64, 32),
-            nn.Sigmoid()
+            nn.Sigmoid(),
         )
 
     def forward(self, x):
-        return self.stack(x)
+        x = self.nwp_parameterizations(x)
+        x = self.black_box_layer(x)
+        x = self.super_res(x)
+        return x
 
     
 ############################################################
@@ -216,6 +220,7 @@ def train():
         if step % 100 == 0:
             num_errors = (probs.round() - inputs).abs().sum().item()
             acc = 1.0 - num_errors / inputs.numel()
+            #print(f"{step=} loss={loss.item():.4f} {acc=:.4f} eps={eps:.4f}")
             print(f"{step=} loss={loss.item():.4f} {acc=:.4f}")
 
         if acc > 0.98:
@@ -226,7 +231,7 @@ def train():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch-size", "--bs", type=int, default=60)
-    parser.add_argument("--bbf", type=int, default=1)
+    parser.add_argument("--bbf", type=int, default=0)
     parser.add_argument("-g", "--gpu", type=int)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--eps", type=float, default=1e-5)
