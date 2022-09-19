@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import argparse
@@ -220,10 +221,15 @@ def train():
         if step % 100 == 0:
             num_errors = (probs.round() - inputs).abs().sum().item()
             acc = 1.0 - num_errors / inputs.numel()
-            #print(f"{step=} loss={loss.item():.4f} {acc=:.4f} eps={eps:.4f}")
-            print(f"{step=} loss={loss.item():.4f} {acc=:.4f}")
+            statstr = f"{step=} loss={loss.item():.4f} {acc=:.4f} logloss={math.log10(loss.item()):.4f}"
+            statstr += f" loglr={math.log10(optimizer.param_groups[0]['lr']):.4f} logeps={math.log10(args.eps):.4f}"
+            print(statstr)
+            args.eps *= args.eps_mult
+            args.lr *= args.lr_mult
+            optimizer.param_groups[0]['lr'] = args.lr
+            assert len(optimizer.param_groups) == 1
 
-        if acc > 0.98:
+        if acc > args.acc_thresh:
             print(f"Reached {acc=:0.4f} in {step} steps.")
             break
 
@@ -233,8 +239,11 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", "--bs", type=int, default=60)
     parser.add_argument("--bbf", type=int, default=0)
     parser.add_argument("-g", "--gpu", type=int)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--lr-mult", type=float, default=1.0)
     parser.add_argument("--eps", type=float, default=1e-5)
+    parser.add_argument("--eps-mult", type=float, default=1.0)
+    parser.add_argument("--acc-thresh", type=float, default=0.98)
     parser.add_argument("--clip", type=float, default=1)
     parser.add_argument("--autograd", action="store_true", help="Use autograd instead of emgrad for comparison.")
     parser.add_argument("-a", "--analytic-comparison-frac", type=float, default=0.0)
